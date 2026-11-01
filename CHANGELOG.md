@@ -7,13 +7,13 @@
 
 ### Изменено
 
-- Обновлена поддерживаемая версия OMP до 18.14.1. Поддержка OMP 18.0.1 и выше сохранена.
+- Обновлена поддерживаемая версия OMP до 18.14.2. Поддержка OMP 18.0.1 и выше сохранена.
 
 ---
 
 ### Changed
 
-- Updated the supported OMP version to 18.14.1. Support for OMP 18.0.1 and later is preserved.
+- Updated the supported OMP version to 18.14.2. Support for OMP 18.0.1 and later is preserved.
 
 ---
 
