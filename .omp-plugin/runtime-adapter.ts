@@ -34,6 +34,7 @@ import type {
 	MutationMessageDetails,
 } from "./messages";
 import type { ModePolicy } from "./mode-policy";
+import { compactDescribe, RowsNodes, stockDescribe } from "./native-describe";
 import { objectRecord } from "./object-record";
 import { DescriptorPatch } from "./patch-kit";
 import {
@@ -213,6 +214,8 @@ export class RuntimeAdapter {
 	 * transcript wrappers and the discovery watcher).
 	 */
 	readonly #patches = new PresentationPatches();
+	/** Nodes the leaf patches hand a TSP terminal (native-describe.ts). */
+	readonly #rowsNodes = new RowsNodes();
 	#transcript: TranscriptHost | undefined;
 	#fold: TranscriptFold | undefined;
 	#timer: unknown;
@@ -829,6 +832,7 @@ export class RuntimeAdapter {
 				isTerminal: (block) => this.#isTerminal(block),
 				isRetirable: (block, nativeFinalized) =>
 					this.#isRetirable(block, nativeFinalized),
+				isPresenting: () => !this.#disposed,
 			});
 		}
 		// Idempotent: the fold re-patches the transcript instance after a
@@ -1402,49 +1406,54 @@ export class RuntimeAdapter {
 		) => readonly string[];
 		const card = this.#advisorProbe(component, original);
 		if (!card) return;
-		const adapter = this;
+		const nativeDescribe = stockDescribe(component);
+		const compactRows = (
+			block: object,
+			width: number,
+		): readonly string[] | undefined => {
+			if (this.#disposed || this.#compactAdvisorNotes?.() !== true)
+				return undefined;
+			// Local native toggles bypass setExpanded. Read the semantic card
+			// at paint time; unknown expansion must remain native. The stock
+			// describe is the captured one: the instance's own is patched.
+			let collapsed: unknown;
+			try {
+				const node = objectRecord(nativeDescribe?.call(block));
+				if (node.k === "card") {
+					const props = objectRecord(node.p);
+					// Native emits collapsed only for >3 notes. Smaller cards have
+					// no local disclosure; use the known global baseline.
+					collapsed =
+						typeof props.collapsed === "boolean"
+							? props.collapsed
+							: props.collapsible === false &&
+									this.#ui.getToolsExpanded?.() === false
+								? true
+								: undefined;
+				}
+			} catch {
+				/* Native metadata failure is not proof of collapse. */
+			}
+			if (collapsed !== true) return undefined;
+			const theme = this.#ui.theme;
+			const bound = this.#advisorBound.get(block);
+			if (!theme || !bound) return undefined;
+			return renderAdvisorRows(bound, theme, width);
+		};
 		try {
-			const patch = new DescriptorPatch(component, ["render"]);
-			patch.install({
+			const wrappers: Record<string, PropertyDescriptor> = {
 				render: {
 					configurable: true,
 					writable: true,
 					value(this: object, width: number): readonly string[] {
-						if (adapter.#disposed || adapter.#compactAdvisorNotes?.() !== true)
-							return original.call(this, width);
-						// Local native toggles bypass setExpanded. Read the semantic
-						// card at paint time; unknown expansion must remain native.
-						let collapsed: unknown;
-						try {
-							const describe = objectRecord(this).describe;
-							const node = objectRecord(
-								typeof describe === "function"
-									? describe.call(this)
-									: undefined,
-							);
-							if (node.k === "card") {
-								const props = objectRecord(node.p);
-								// Native emits collapsed only for >3 notes. Smaller cards
-								// have no local disclosure; use the known global baseline.
-								collapsed =
-									typeof props.collapsed === "boolean"
-										? props.collapsed
-										: props.collapsible === false &&
-												adapter.#ui.getToolsExpanded?.() === false
-											? true
-											: undefined;
-							}
-						} catch {
-							/* Native metadata failure is not proof of collapse. */
-						}
-						if (collapsed !== true) return original.call(this, width);
-						const theme = adapter.#ui.theme;
-						const bound = adapter.#advisorBound.get(this);
-						if (!theme || !bound) return original.call(this, width);
-						return renderAdvisorRows(bound, theme, width);
+						return compactRows(this, width) ?? original.call(this, width);
 					},
 				},
-			});
+			};
+			const describe = compactDescribe(component, compactRows, this.#rowsNodes);
+			if (describe) wrappers.describe = describe;
+			const patch = new DescriptorPatch(component, Object.keys(wrappers));
+			patch.install(wrappers);
 			this.#patches.advisor.set(component, patch);
 			this.#advisorNative.set(component, original);
 			this.#advisorBound.set(component, card);
@@ -1558,23 +1567,30 @@ export class RuntimeAdapter {
 			this: RenderableBlock,
 			width: number,
 		) => readonly string[];
-		const adapter = this;
+		const compactRows = (
+			block: object,
+			width: number,
+		): readonly string[] | undefined => {
+			if (this.#disposed) return undefined;
+			const theme = this.#ui.theme;
+			if (!theme) return undefined;
+			const view = extract(block);
+			return view ? renderRow(view, theme, width) : undefined;
+		};
 		try {
-			const patch = new DescriptorPatch(component, ["render"]);
-			patch.install({
+			const wrappers: Record<string, PropertyDescriptor> = {
 				render: {
 					configurable: true,
 					writable: true,
 					value(this: RenderableBlock, width: number): readonly string[] {
-						if (adapter.#disposed) return original.call(this, width);
-						const theme = adapter.#ui.theme;
-						if (!theme) return original.call(this, width);
-						const view = extract(this);
-						if (!view) return original.call(this, width);
-						return renderRow(view, theme, width);
+						return compactRows(this, width) ?? original.call(this, width);
 					},
 				},
-			});
+			};
+			const describe = compactDescribe(component, compactRows, this.#rowsNodes);
+			if (describe) wrappers.describe = describe;
+			const patch = new DescriptorPatch(component, Object.keys(wrappers));
+			patch.install(wrappers);
 			patches.set(component, patch);
 		} catch {
 			// Capability skew fails open: leave the stock card alone.
@@ -1705,7 +1721,6 @@ export class RuntimeAdapter {
 			) => unknown;
 		}
 
-		const adapter = this;
 		const state = states.get(component) ?? ({} as TState);
 		if (state.expanded === undefined) {
 			try {
@@ -1727,27 +1742,25 @@ export class RuntimeAdapter {
 		}
 		states.set(component, state);
 
-		// Capture order matches the three former sites: render, optional
-		// setComplete, setExpanded. DescriptorPatch install follows this order.
-		const methodNames = observeComplete
-			? (["render", "setComplete", "setExpanded"] as const)
-			: (["render", "setExpanded"] as const);
-
+		const compactRows = (
+			block: object,
+			width: number,
+		): readonly string[] | undefined => {
+			if (this.#disposed) return undefined;
+			const theme = this.#ui.theme;
+			if (!theme) return undefined;
+			const view = extract(block, states.get(block));
+			// Expanded or unknown keeps the complete native body readable.
+			if (view?.expanded !== false) return undefined;
+			return renderRow(view, theme, width);
+		};
 		try {
-			const patch = new DescriptorPatch(component, methodNames);
 			const wrappers: Record<string, PropertyDescriptor> = {
 				render: {
 					configurable: true,
 					writable: true,
 					value(this: RenderableBlock, width: number): readonly string[] {
-						if (adapter.#disposed) return render.call(this, width);
-						const theme = adapter.#ui.theme;
-						if (!theme) return render.call(this, width);
-						const view = extract(this, states.get(this));
-						if (!view) return render.call(this, width);
-						// Expanded or unknown keeps the complete native body readable.
-						if (view.expanded !== false) return render.call(this, width);
-						return renderRow(view, theme, width);
+						return compactRows(this, width) ?? render.call(this, width);
 					},
 				},
 				setExpanded: {
@@ -1779,6 +1792,9 @@ export class RuntimeAdapter {
 					},
 				};
 			}
+			const describe = compactDescribe(component, compactRows, this.#rowsNodes);
+			if (describe) wrappers.describe = describe;
+			const patch = new DescriptorPatch(component, Object.keys(wrappers));
 			patch.install(wrappers);
 			patches.set(component, patch);
 		} catch {
